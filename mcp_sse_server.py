@@ -402,6 +402,21 @@ class BigQueryMCPServer:
             logger.error(f"Errore nell'esecuzione dello strumento {name}: {e}")
             return [{"type": "text", "text": f"Errore: {str(e)}"}]
 
+    def _convert_to_dict(self, content_list):
+        """Helper function per convertire TextContent objects in dizionari"""
+        result = []
+        for content in content_list:
+            if hasattr(content, 'model_dump'):
+                # È un oggetto Pydantic (TextContent)
+                result.append(content.model_dump())
+            elif isinstance(content, dict):
+                # È già un dizionario
+                result.append(content)
+            else:
+                # Fallback: converti in dizionario
+                result.append({"type": "text", "text": str(content)})
+        return result
+
 # FastAPI app per SSE
 app = FastAPI(title="BigQuery MCP SSE Server")
 
@@ -469,7 +484,8 @@ async def list_tools():
             return {"error": "Server MCP non inizializzato"}
         
         tools = await mcp_server.get_available_tools()
-        return {"tools": [tool.model_dump() for tool in tools]}
+        # tools è già una lista di dizionari, non serve .model_dump()
+        return {"tools": tools}
     except Exception as e:
         return {"error": str(e)}
 
@@ -487,7 +503,8 @@ async def execute_tool(request: dict):
             return {"error": "tool_name richiesto"}
         
         result = await mcp_server.execute_tool(tool_name, arguments)
-        return {"result": [content.model_dump() for content in result]}
+        # Usa la funzione helper per convertire correttamente i risultati
+        return {"result": mcp_server._convert_to_dict(result)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -504,9 +521,10 @@ async def sse_tools(request: Request):
                 return
             
             tools = await mcp_server.get_available_tools()
+            # tools è già una lista di dizionari, non serve .model_dump()
             yield {
                 "event": "tools",
-                "data": json.dumps({"tools": [tool.model_dump() for tool in tools]})
+                "data": json.dumps({"tools": tools})
             }
         except Exception as e:
             yield {
@@ -552,10 +570,10 @@ async def sse_execute(request: Request):
             # Esegui lo strumento
             result = await mcp_server.execute_tool(tool_name, arguments)
             
-            # Invia il risultato
+            # Usa la funzione helper per convertire correttamente i risultati
             yield {
                 "event": "result",
-                "data": json.dumps({"result": [content.model_dump() for content in result]})
+                "data": json.dumps({"result": mcp_server._convert_to_dict(result)})
             }
             
             # Invia evento di completamento
