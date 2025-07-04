@@ -13,8 +13,8 @@ import google.auth.exceptions
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent
-from sse_starlette import EventSourceResponse
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -54,7 +54,6 @@ class BigQueryMCPServer:
                         )
                     elif credentials_info.get('type') == 'authorized_user':
                         # Per credenziali authorized_user, creiamo un file temporaneo
-                        import tempfile
                         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                             json.dump(credentials_info, f)
                             temp_file = f.name
@@ -421,7 +420,7 @@ class BigQueryMCPServer:
 # FastAPI app per SSE
 app = FastAPI(title="BigQuery MCP SSE Server")
 
-# Configura CORS - IMPORTANTE: DOPO la definizione di app
+# Configura CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -487,7 +486,6 @@ async def list_tools_universal():
             return {"error": "Server MCP non inizializzato"}
         
         tools = await mcp_server.get_available_tools()
-        # tools è già una lista di dizionari, non serve .model_dump()
         return {"tools": tools}
     except Exception as e:
         return {"error": str(e)}
@@ -506,37 +504,36 @@ async def execute_tool(request: dict):
             return {"error": "tool_name richiesto"}
         
         result = await mcp_server.execute_tool(tool_name, arguments)
-        # Usa la funzione helper per convertire correttamente i risultati
         return {"result": mcp_server._convert_to_dict(result)}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/sse/tools")
 async def sse_tools(request: Request):
-    """Endpoint SSE per listare gli strumenti"""
+    """Endpoint SSE per n8n MCP Client - formato esatto richiesto"""
+    
     async def event_generator():
         try:
             if not mcp_server:
-                yield f"event: error\ndata: {json.dumps({'error': 'Server MCP non inizializzato'})}\n\n"
+                yield "event: error\n"
+                yield f"data: {json.dumps({'error': 'Server MCP non inizializzato'})}\n\n"
                 return
             
-            # Invia evento di connessione
-            yield f"event: connected\ndata: {json.dumps({'status': 'connected', 'timestamp': datetime.now().isoformat()})}\n\n"
-            
+            # Ottieni la lista degli strumenti
             tools = await mcp_server.get_available_tools()
-            # tools è già una lista di dizionari, non serve .model_dump()
-            yield f"event: tools\ndata: {json.dumps({'tools': tools})}\n\n"
             
-            # Mantieni la connessione viva
-            while True:
-                if await request.is_disconnected():
-                    break
-                yield f"event: heartbeat\ndata: {json.dumps({'timestamp': datetime.now().isoformat()})}\n\n"
-                await asyncio.sleep(30)
-                
+            # Invia evento tools nel formato esatto richiesto da n8n
+            yield "event: tools\n"
+            yield f"data: {json.dumps({'tools': tools})}\n\n"
+            
+            # Invia evento done come richiesto da n8n
+            yield "event: done\n"
+            yield "data: null\n\n"
+            
         except Exception as e:
             logger.error(f"SSE Error: {e}")
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield "event: error\n"
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
     
     return StreamingResponse(
         event_generator(),
@@ -547,59 +544,7 @@ async def sse_tools(request: Request):
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-            "Access-Control-Expose-Headers": "*",
-            "Content-Type": "text/event-stream",
-            "X-Accel-Buffering": "no"  # Per nginx
-        }
-    )
-
-@app.post("/sse/execute")
-async def sse_execute(request: Request):
-    """Endpoint SSE per eseguire strumenti"""
-    try:
-        body = await request.json()
-    except:
-        body = {}
-    
-    async def event_generator():
-        try:
-            if not mcp_server:
-                yield f"event: error\ndata: {json.dumps({'error': 'Server MCP non inizializzato'})}\n\n"
-                return
-            
-            tool_name = body.get("tool_name")
-            arguments = body.get("arguments", {})
-            
-            if not tool_name:
-                yield f"event: error\ndata: {json.dumps({'error': 'tool_name richiesto'})}\n\n"
-                return
-            
-            # Invia evento di inizio
-            yield f"event: start\ndata: {json.dumps({'tool_name': tool_name, 'arguments': arguments})}\n\n"
-            
-            # Esegui lo strumento
-            result = await mcp_server.execute_tool(tool_name, arguments)
-            
-            # Usa la funzione helper per convertire correttamente i risultati
-            yield f"event: result\ndata: {json.dumps({'result': mcp_server._convert_to_dict(result)})}\n\n"
-            
-            # Invia evento di completamento
-            yield f"event: complete\ndata: {json.dumps({'status': 'success'})}\n\n"
-            
-        except Exception as e:
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-            "Access-Control-Expose-Headers": "*",
-            "Content-Type": "text/event-stream"
+            "Access-Control-Expose-Headers": "*"
         }
     )
 
