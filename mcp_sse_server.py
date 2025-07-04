@@ -323,29 +323,84 @@ class BigQueryMCPServer:
 
     async def get_available_tools(self):
         """Metodo helper per ottenere la lista degli strumenti"""
-        try:
-            # Chiamiamo direttamente la funzione registrata
-            tools_func = self.server._tools_handler
-            if tools_func:
-                return await tools_func()
-            else:
-                return []
-        except Exception as e:
-            logger.error(f"Errore nel recuperare gli strumenti: {e}")
-            return []
+        return [
+            {
+                "name": "query_bigquery",
+                "description": "Esegue una query SQL su BigQuery",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Query SQL da eseguire"
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Limite di righe da restituire (default: 100)",
+                            "default": 100
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "list_datasets",
+                "description": "Lista tutti i dataset disponibili nel progetto",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "list_tables",
+                "description": "Lista le tabelle in un dataset",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset_id": {
+                            "type": "string",
+                            "description": "ID del dataset"
+                        }
+                    },
+                    "required": ["dataset_id"]
+                }
+            },
+            {
+                "name": "describe_table",
+                "description": "Descrive la struttura di una tabella",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "dataset_id": {
+                            "type": "string",
+                            "description": "ID del dataset"
+                        },
+                        "table_id": {
+                            "type": "string",
+                            "description": "ID della tabella"
+                        }
+                    },
+                    "required": ["dataset_id", "table_id"]
+                }
+            }
+        ]
 
     async def execute_tool(self, name: str, arguments: Dict[str, Any]):
         """Metodo helper per eseguire uno strumento"""
         try:
-            # Chiamiamo direttamente la funzione registrata
-            call_func = self.server._call_tool_handler
-            if call_func:
-                return await call_func(name, arguments)
+            if name == "query_bigquery":
+                return await self._execute_query(arguments)
+            elif name == "list_datasets":
+                return await self._list_datasets()
+            elif name == "list_tables":
+                return await self._list_tables(arguments)
+            elif name == "describe_table":
+                return await self._describe_table(arguments)
             else:
-                return [TextContent(type="text", text="Nessun gestore strumenti configurato")]
+                return [{"type": "text", "text": f"Strumento sconosciuto: {name}"}]
         except Exception as e:
-            logger.error(f"Errore nell'esecuzione dello strumento: {e}")
-            return [TextContent(type="text", text=f"Errore: {str(e)}")]
+            logger.error(f"Errore nell'esecuzione dello strumento {name}: {e}")
+            return [{"type": "text", "text": f"Errore: {str(e)}"}]
 
 # FastAPI app per SSE
 app = FastAPI(title="BigQuery MCP SSE Server")
