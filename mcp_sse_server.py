@@ -476,9 +476,10 @@ async def health_check():
             "error": str(e)
         }
 
-@app.post("/tools")
-async def list_tools():
-    """Endpoint per listare gli strumenti disponibili"""
+# Endpoint tools che supporta sia GET che POST
+@app.api_route("/tools", methods=["GET", "POST"])
+async def list_tools_universal():
+    """Endpoint universale per listare gli strumenti disponibili (GET e POST)"""
     try:
         if not mcp_server:
             return {"error": "Server MCP non inizializzato"}
