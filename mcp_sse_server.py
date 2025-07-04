@@ -44,18 +44,46 @@ class BigQueryMCPServer:
                 # Parse del JSON delle credenziali
                 try:
                     credentials_info = json.loads(credentials_json)
-                    credentials = service_account.Credentials.from_service_account_info(
-                        credentials_info,
-                        scopes=['https://www.googleapis.com/auth/bigquery']
-                    )
+                    logger.info(f"Tipo di credenziali: {credentials_info.get('type', 'unknown')}")
+                    
+                    # Gestione di diversi tipi di credenziali
+                    if credentials_info.get('type') == 'service_account':
+                        credentials = service_account.Credentials.from_service_account_info(
+                            credentials_info,
+                            scopes=['https://www.googleapis.com/auth/bigquery']
+                        )
+                    elif credentials_info.get('type') == 'authorized_user':
+                        # Per credenziali authorized_user, creiamo un file temporaneo
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                            json.dump(credentials_info, f)
+                            temp_file = f.name
+                        
+                        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file
+                        credentials = None  # Usa le credenziali di default dal file
+                    else:
+                        # Prova con le credenziali come oggetto generico
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                            json.dump(credentials_info, f)
+                            temp_file = f.name
+                        
+                        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file
+                        credentials = None
+                    
                     self.client = bigquery.Client(
                         project=self.project_id, 
                         credentials=credentials
                     )
                     logger.info(f"Client BigQuery inizializzato con successo per il progetto: {self.project_id}")
+                    
                 except json.JSONDecodeError as e:
                     logger.error(f"Errore nel parsing del JSON delle credenziali: {e}")
                     raise
+                except Exception as e:
+                    logger.error(f"Errore nella configurazione delle credenziali: {e}")
+                    # Fallback: prova senza credenziali specifiche
+                    logger.info("Tentativo fallback con credenziali di default")
+                    self.client = bigquery.Client(project=self.project_id)
             else:
                 # Fallback alle credenziali di default
                 logger.info("Tentativo di utilizzo delle credenziali di default")
