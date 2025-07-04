@@ -11,7 +11,6 @@ from google.oauth2 import service_account
 import google.auth.exceptions
 
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from sse_starlette import EventSourceResponse
 from fastapi import FastAPI, Request
@@ -322,6 +321,32 @@ class BigQueryMCPServer:
             logger.error(f"Errore nel descrivere la tabella: {e}")
             return [TextContent(type="text", text=f"Errore: {str(e)}")]
 
+    async def get_available_tools(self):
+        """Metodo helper per ottenere la lista degli strumenti"""
+        try:
+            # Chiamiamo direttamente la funzione registrata
+            tools_func = self.server._tools_handler
+            if tools_func:
+                return await tools_func()
+            else:
+                return []
+        except Exception as e:
+            logger.error(f"Errore nel recuperare gli strumenti: {e}")
+            return []
+
+    async def execute_tool(self, name: str, arguments: Dict[str, Any]):
+        """Metodo helper per eseguire uno strumento"""
+        try:
+            # Chiamiamo direttamente la funzione registrata
+            call_func = self.server._call_tool_handler
+            if call_func:
+                return await call_func(name, arguments)
+            else:
+                return [TextContent(type="text", text="Nessun gestore strumenti configurato")]
+        except Exception as e:
+            logger.error(f"Errore nell'esecuzione dello strumento: {e}")
+            return [TextContent(type="text", text=f"Errore: {str(e)}")]
+
 # FastAPI app per SSE
 app = FastAPI(title="BigQuery MCP SSE Server")
 
@@ -388,7 +413,7 @@ async def list_tools():
         if not mcp_server:
             return {"error": "Server MCP non inizializzato"}
         
-        tools = await mcp_server.server.list_tools()()
+        tools = await mcp_server.get_available_tools()
         return {"tools": [tool.model_dump() for tool in tools]}
     except Exception as e:
         return {"error": str(e)}
@@ -406,7 +431,7 @@ async def execute_tool(request: dict):
         if not tool_name:
             return {"error": "tool_name richiesto"}
         
-        result = await mcp_server.server.call_tool()(tool_name, arguments)
+        result = await mcp_server.execute_tool(tool_name, arguments)
         return {"result": [content.model_dump() for content in result]}
     except Exception as e:
         return {"error": str(e)}
@@ -423,7 +448,7 @@ async def sse_tools(request: Request):
                 }
                 return
             
-            tools = await mcp_server.server.list_tools()()
+            tools = await mcp_server.get_available_tools()
             yield {
                 "event": "tools",
                 "data": json.dumps({"tools": [tool.model_dump() for tool in tools]})
@@ -470,7 +495,7 @@ async def sse_execute(request: Request):
             }
             
             # Esegui lo strumento
-            result = await mcp_server.server.call_tool()(tool_name, arguments)
+            result = await mcp_server.execute_tool(tool_name, arguments)
             
             # Invia il risultato
             yield {
