@@ -13,8 +13,8 @@ import google.auth.exceptions
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -417,15 +417,15 @@ class BigQueryMCPServer:
                 result.append({"type": "text", "text": str(content)})
         return result
 
-# FastAPI app per SSE
-app = FastAPI(title="BigQuery MCP SSE Server")
+# FastAPI app
+app = FastAPI(title="BigQuery MCP HTTP Streamable Server")
 
 # Configura CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"]
 )
@@ -446,9 +446,15 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {
-        "message": "BigQuery MCP SSE Server",
+        "message": "BigQuery MCP HTTP Streamable Server",
         "status": "running",
-        "project_id": mcp_server.project_id if mcp_server else None
+        "project_id": mcp_server.project_id if mcp_server else None,
+        "protocol": "HTTP Streamable",
+        "endpoints": {
+            "initialize": "/initialize",
+            "tools": "/tools",
+            "call": "/call"
+        }
     }
 
 @app.get("/health")
@@ -477,10 +483,84 @@ async def health_check():
             "error": str(e)
         }
 
-# Endpoint tools che supporta sia GET che POST
-@app.api_route("/tools", methods=["GET", "POST"])
-async def list_tools_universal():
-    """Endpoint universale per listare gli strumenti disponibili (GET e POST)"""
+# MCP HTTP Streamable Protocol Endpoints
+
+@app.post("/initialize")
+async def initialize():
+    """Inizializza la connessione MCP"""
+    try:
+        if not mcp_server:
+            raise HTTPException(status_code=500, detail="Server MCP non inizializzato")
+        
+        return {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {},
+                "prompts": {},
+                "resources": {}
+            },
+            "serverInfo": {
+                "name": "BigQuery MCP Server",
+                "version": "1.0.0"
+            },
+            "instructions": "Server MCP per BigQuery pronto per l'uso"
+        }
+    except Exception as e:
+        logger.error(f"Errore inizializzazione: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/tools")
+async def list_tools():
+    """Lista tutti gli strumenti disponibili"""
+    try:
+        if not mcp_server:
+            raise HTTPException(status_code=500, detail="Server MCP non inizializzato")
+        
+        tools = await mcp_server.get_available_tools()
+        return {"tools": tools}
+    except Exception as e:
+        logger.error(f"Errore lista tools: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/call")
+async def call_tool(request: Request):
+    """Esegue uno strumento con streaming response"""
+    try:
+        if not mcp_server:
+            raise HTTPException(status_code=500, detail="Server MCP non inizializzato")
+        
+        body = await request.json()
+        tool_name = body.get("name")
+        arguments = body.get("arguments", {})
+        
+        if not tool_name:
+            raise HTTPException(status_code=400, detail="Nome strumento richiesto")
+        
+        logger.info(f"Esecuzione tool: {tool_name} con argomenti: {arguments}")
+        
+        # Esegui lo strumento
+        result = await mcp_server.execute_tool(tool_name, arguments)
+        converted_result = mcp_server._convert_to_dict(result)
+        
+        # Restituisci in formato MCP
+        return {
+            "content": converted_result,
+            "isError": False
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore esecuzione tool: {e}")
+        return {
+            "content": [{"type": "text", "text": f"Errore: {str(e)}"}],
+            "isError": True
+        }
+
+# Endpoint di compatibilità per testing
+@app.get("/tools")
+async def get_tools():
+    """Endpoint GET per compatibility"""
     try:
         if not mcp_server:
             return {"error": "Server MCP non inizializzato"}
@@ -491,14 +571,15 @@ async def list_tools_universal():
         return {"error": str(e)}
 
 @app.post("/execute")
-async def execute_tool(request: dict):
-    """Endpoint per eseguire uno strumento"""
+async def execute_tool_post(request: Request):
+    """Endpoint POST per compatibility"""
     try:
         if not mcp_server:
             return {"error": "Server MCP non inizializzato"}
         
-        tool_name = request.get("tool_name")
-        arguments = request.get("arguments", {})
+        body = await request.json()
+        tool_name = body.get("tool_name") or body.get("name")
+        arguments = body.get("arguments", {})
         
         if not tool_name:
             return {"error": "tool_name richiesto"}
@@ -507,46 +588,6 @@ async def execute_tool(request: dict):
         return {"result": mcp_server._convert_to_dict(result)}
     except Exception as e:
         return {"error": str(e)}
-
-@app.get("/sse/tools")
-async def sse_tools(request: Request):
-    """Endpoint SSE per n8n MCP Client - formato esatto richiesto"""
-    
-    async def event_generator():
-        try:
-            if not mcp_server:
-                yield "event: error\n"
-                yield f"data: {json.dumps({'error': 'Server MCP non inizializzato'})}\n\n"
-                return
-            
-            # Ottieni la lista degli strumenti
-            tools = await mcp_server.get_available_tools()
-            
-            # Invia evento tools nel formato esatto richiesto da n8n
-            yield "event: tools\n"
-            yield f"data: {json.dumps({'tools': tools})}\n\n"
-            
-            # Invia evento done come richiesto da n8n
-            yield "event: done\n"
-            yield "data: null\n\n"
-            
-        except Exception as e:
-            logger.error(f"SSE Error: {e}")
-            yield "event: error\n"
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-            "Access-Control-Expose-Headers": "*"
-        }
-    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
