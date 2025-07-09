@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 import uvicorn
 
 # Setup logging
@@ -64,13 +65,31 @@ def initialize_bigquery_client():
         if not project_id:
             raise ValueError("GOOGLE_PROJECT_ID environment variable not set")
         
-        # Try service account JSON from environment variable
+        # Try credentials JSON from environment variable
         credentials_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
         if credentials_json:
             credentials_info = json.loads(credentials_json)
-            credentials = service_account.Credentials.from_service_account_info(credentials_info)
-            bigquery_client = bigquery.Client(project=project_id, credentials=credentials)
-            logger.info("BigQuery client initialized with service account from JSON")
+            
+            # Check credential type
+            if credentials_info.get('type') == 'service_account':
+                # Use service account credentials
+                credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                bigquery_client = bigquery.Client(project=project_id, credentials=credentials)
+                logger.info("BigQuery client initialized with service account from JSON")
+            elif credentials_info.get('type') == 'authorized_user':
+                # Use authorized user credentials (OAuth2)
+                from google.oauth2.credentials import Credentials
+                credentials = Credentials(
+                    token=None,  # Will be refreshed automatically
+                    refresh_token=credentials_info.get('refresh_token'),
+                    client_id=credentials_info.get('client_id'),
+                    client_secret=credentials_info.get('client_secret'),
+                    token_uri='https://oauth2.googleapis.com/token'
+                )
+                bigquery_client = bigquery.Client(project=project_id, credentials=credentials)
+                logger.info("BigQuery client initialized with authorized user credentials from JSON")
+            else:
+                raise ValueError(f"Unsupported credential type: {credentials_info.get('type')}")
         else:
             # Fall back to Application Default Credentials
             bigquery_client = bigquery.Client(project=project_id)
