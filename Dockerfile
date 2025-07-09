@@ -1,19 +1,33 @@
+# Dockerfile
 FROM python:3.11-slim
 
-# Imposta la directory di lavoro
+# Set working directory
 WORKDIR /app
 
-# Copia i file di dipendenze
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
 COPY requirements.txt .
 
-# Installa le dipendenze
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia il codice sorgente
-COPY mcp_sse_server.py .
+# Copy application code
+COPY . .
 
-# Esponi la porta
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
 EXPOSE 8000
 
-# Comando per avviare l'applicazione
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start command
 CMD ["python", "mcp_sse_server.py"]
