@@ -1,594 +1,555 @@
 #!/usr/bin/env python3
+"""
+MCP BigQuery Server con supporto HTTP Streamable
+Compatible with n8n MCP Client Tool
+"""
+
 import asyncio
 import json
 import logging
 import os
-import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from datetime import datetime
 
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 from google.cloud import bigquery
 from google.oauth2 import service_account
-import google.auth.exceptions
-
-from mcp.server import Server
-from mcp.types import Tool, TextContent
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# Configurazione logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class BigQueryMCPServer:
-    def __init__(self):
-        self.server = Server("bigquery-mcp")
-        self.client = None
-        self.project_id = None
-        self._initialize_client()
-        self._setup_tools()
+# Pydantic models for MCP protocol
+class MCPRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    id: Union[int, str]
+    method: str
+    params: Optional[Dict[str, Any]] = {}
 
-    def _initialize_client(self):
-        """Inizializza il client BigQuery con gestione delle credenziali"""
-        try:
-            # Ottieni project ID dalle variabili d'ambiente
-            self.project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'big-query-instilla')
-            
-            # Gestione delle credenziali
-            credentials_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
-            
-            if credentials_json:
-                logger.info("Utilizzando credenziali da GOOGLE_APPLICATION_CREDENTIALS_JSON")
-                # Parse del JSON delle credenziali
-                try:
-                    credentials_info = json.loads(credentials_json)
-                    logger.info(f"Tipo di credenziali: {credentials_info.get('type', 'unknown')}")
-                    
-                    # Gestione di diversi tipi di credenziali
-                    if credentials_info.get('type') == 'service_account':
-                        credentials = service_account.Credentials.from_service_account_info(
-                            credentials_info,
-                            scopes=['https://www.googleapis.com/auth/bigquery']
-                        )
-                    elif credentials_info.get('type') == 'authorized_user':
-                        # Per credenziali authorized_user, creiamo un file temporaneo
-                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                            json.dump(credentials_info, f)
-                            temp_file = f.name
-                        
-                        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file
-                        credentials = None  # Usa le credenziali di default dal file
-                    else:
-                        # Prova con le credenziali come oggetto generico
-                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                            json.dump(credentials_info, f)
-                            temp_file = f.name
-                        
-                        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file
-                        credentials = None
-                    
-                    self.client = bigquery.Client(
-                        project=self.project_id, 
-                        credentials=credentials
-                    )
-                    logger.info(f"Client BigQuery inizializzato con successo per il progetto: {self.project_id}")
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Errore nel parsing del JSON delle credenziali: {e}")
-                    raise
-                except Exception as e:
-                    logger.error(f"Errore nella configurazione delle credenziali: {e}")
-                    # Fallback: prova senza credenziali specifiche
-                    logger.info("Tentativo fallback con credenziali di default")
-                    self.client = bigquery.Client(project=self.project_id)
-            else:
-                # Fallback alle credenziali di default
-                logger.info("Tentativo di utilizzo delle credenziali di default")
-                self.client = bigquery.Client(project=self.project_id)
-                logger.info(f"Client BigQuery inizializzato con credenziali di default per il progetto: {self.project_id}")
-                
-        except Exception as e:
-            logger.error(f"Errore nell'inizializzazione del client BigQuery: {e}")
-            raise
+class MCPResponse(BaseModel):
+    jsonrpc: str = "2.0"
+    id: Union[int, str]
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
 
-    def _setup_tools(self):
-        """Configura gli strumenti MCP"""
-        
-        @self.server.list_tools()
-        async def list_tools() -> List[Tool]:
-            return [
-                Tool(
-                    name="query_bigquery",
-                    description="Esegue una query SQL su BigQuery",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Query SQL da eseguire"
-                            },
-                            "limit": {
-                                "type": "number",
-                                "description": "Limite di righe da restituire (default: 100)",
-                                "default": 100
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                Tool(
-                    name="list_datasets",
-                    description="Lista tutti i dataset disponibili nel progetto",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {}
-                    }
-                ),
-                Tool(
-                    name="list_tables", 
-                    description="Lista le tabelle in un dataset",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "dataset_id": {
-                                "type": "string",
-                                "description": "ID del dataset"
-                            }
-                        },
-                        "required": ["dataset_id"]
-                    }
-                ),
-                Tool(
-                    name="describe_table",
-                    description="Descrive la struttura di una tabella",
-                    inputSchema={
-                        "type": "object", 
-                        "properties": {
-                            "dataset_id": {
-                                "type": "string",
-                                "description": "ID del dataset"
-                            },
-                            "table_id": {
-                                "type": "string", 
-                                "description": "ID della tabella"
-                            }
-                        },
-                        "required": ["dataset_id", "table_id"]
-                    }
-                )
-            ]
+# FastAPI app initialization
+app = FastAPI(
+    title="BigQuery MCP Server",
+    description="Model Context Protocol server for BigQuery with HTTP Streamable support",
+    version="1.0.0"
+)
 
-        @self.server.call_tool()
-        async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-            try:
-                if name == "query_bigquery":
-                    return await self._execute_query(arguments)
-                elif name == "list_datasets":
-                    return await self._list_datasets()
-                elif name == "list_tables":
-                    return await self._list_tables(arguments)
-                elif name == "describe_table":
-                    return await self._describe_table(arguments)
-                else:
-                    return [TextContent(type="text", text=f"Strumento sconosciuto: {name}")]
-            except Exception as e:
-                logger.error(f"Errore nell'esecuzione dello strumento {name}: {e}")
-                return [TextContent(type="text", text=f"Errore: {str(e)}")]
-
-    async def _execute_query(self, arguments: Dict[str, Any]) -> List[TextContent]:
-        """Esegue una query BigQuery"""
-        query = arguments.get("query")
-        limit = arguments.get("limit", 100)
-        
-        if not query:
-            return [TextContent(type="text", text="Query non fornita")]
-        
-        try:
-            # Aggiungi LIMIT se non presente
-            if "LIMIT" not in query.upper() and limit:
-                query = f"{query} LIMIT {limit}"
-            
-            logger.info(f"Esecuzione query: {query}")
-            query_job = self.client.query(query)
-            results = query_job.result()
-            
-            # Converti i risultati in formato leggibile
-            rows = []
-            for row in results:
-                rows.append(dict(row))
-            
-            if not rows:
-                return [TextContent(type="text", text="Nessun risultato trovato")]
-            
-            # Formatta la risposta
-            response = {
-                "query": query,
-                "total_rows": len(rows),
-                "results": rows
-            }
-            
-            return [TextContent(type="text", text=json.dumps(response, indent=2, default=str))]
-            
-        except Exception as e:
-            logger.error(f"Errore nell'esecuzione della query: {e}")
-            return [TextContent(type="text", text=f"Errore nella query: {str(e)}")]
-
-    async def _list_datasets(self) -> List[TextContent]:
-        """Lista tutti i dataset nel progetto"""
-        try:
-            datasets = list(self.client.list_datasets())
-            
-            if not datasets:
-                return [TextContent(type="text", text="Nessun dataset trovato")]
-            
-            dataset_list = []
-            for dataset in datasets:
-                dataset_info = {
-                    "dataset_id": dataset.dataset_id,
-                    "project": dataset.project,
-                    "full_dataset_id": f"{dataset.project}.{dataset.dataset_id}"
-                }
-                dataset_list.append(dataset_info)
-            
-            response = {
-                "project_id": self.project_id,
-                "total_datasets": len(dataset_list),
-                "datasets": dataset_list
-            }
-            
-            return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            
-        except Exception as e:
-            logger.error(f"Errore nel recuperare i dataset: {e}")
-            return [TextContent(type="text", text=f"Errore: {str(e)}")]
-
-    async def _list_tables(self, arguments: Dict[str, Any]) -> List[TextContent]:
-        """Lista le tabelle in un dataset"""
-        dataset_id = arguments.get("dataset_id")
-        
-        if not dataset_id:
-            return [TextContent(type="text", text="dataset_id non fornito")]
-        
-        try:
-            dataset_ref = self.client.dataset(dataset_id)
-            tables = list(self.client.list_tables(dataset_ref))
-            
-            if not tables:
-                return [TextContent(type="text", text=f"Nessuna tabella trovata nel dataset {dataset_id}")]
-            
-            table_list = []
-            for table in tables:
-                table_info = {
-                    "table_id": table.table_id,
-                    "dataset_id": table.dataset_id,
-                    "project": table.project,
-                    "full_table_id": f"{table.project}.{table.dataset_id}.{table.table_id}",
-                    "table_type": table.table_type
-                }
-                table_list.append(table_info)
-            
-            response = {
-                "dataset_id": dataset_id,
-                "total_tables": len(table_list),
-                "tables": table_list
-            }
-            
-            return [TextContent(type="text", text=json.dumps(response, indent=2))]
-            
-        except Exception as e:
-            logger.error(f"Errore nel recuperare le tabelle: {e}")
-            return [TextContent(type="text", text=f"Errore: {str(e)}")]
-
-    async def _describe_table(self, arguments: Dict[str, Any]) -> List[TextContent]:
-        """Descrive la struttura di una tabella"""
-        dataset_id = arguments.get("dataset_id")
-        table_id = arguments.get("table_id")
-        
-        if not dataset_id or not table_id:
-            return [TextContent(type="text", text="dataset_id e table_id sono obbligatori")]
-        
-        try:
-            table_ref = self.client.dataset(dataset_id).table(table_id)
-            table = self.client.get_table(table_ref)
-            
-            fields = []
-            for field in table.schema:
-                field_info = {
-                    "name": field.name,
-                    "field_type": field.field_type,
-                    "mode": field.mode,
-                    "description": field.description
-                }
-                fields.append(field_info)
-            
-            response = {
-                "project": table.project,
-                "dataset_id": table.dataset_id,
-                "table_id": table.table_id,
-                "full_table_id": f"{table.project}.{table.dataset_id}.{table.table_id}",
-                "num_rows": table.num_rows,
-                "num_bytes": table.num_bytes,
-                "created": table.created.isoformat() if table.created else None,
-                "modified": table.modified.isoformat() if table.modified else None,
-                "schema": fields
-            }
-            
-            return [TextContent(type="text", text=json.dumps(response, indent=2, default=str))]
-            
-        except Exception as e:
-            logger.error(f"Errore nel descrivere la tabella: {e}")
-            return [TextContent(type="text", text=f"Errore: {str(e)}")]
-
-    async def get_available_tools(self):
-        """Metodo helper per ottenere la lista degli strumenti"""
-        return [
-            {
-                "name": "query_bigquery",
-                "description": "Esegue una query SQL su BigQuery",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Query SQL da eseguire"
-                        },
-                        "limit": {
-                            "type": "number",
-                            "description": "Limite di righe da restituire (default: 100)",
-                            "default": 100
-                        }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "list_datasets",
-                "description": "Lista tutti i dataset disponibili nel progetto",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "list_tables",
-                "description": "Lista le tabelle in un dataset",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "dataset_id": {
-                            "type": "string",
-                            "description": "ID del dataset"
-                        }
-                    },
-                    "required": ["dataset_id"]
-                }
-            },
-            {
-                "name": "describe_table",
-                "description": "Descrive la struttura di una tabella",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "dataset_id": {
-                            "type": "string",
-                            "description": "ID del dataset"
-                        },
-                        "table_id": {
-                            "type": "string",
-                            "description": "ID della tabella"
-                        }
-                    },
-                    "required": ["dataset_id", "table_id"]
-                }
-            }
-        ]
-
-    async def execute_tool(self, name: str, arguments: Dict[str, Any]):
-        """Metodo helper per eseguire uno strumento"""
-        try:
-            if name == "query_bigquery":
-                return await self._execute_query(arguments)
-            elif name == "list_datasets":
-                return await self._list_datasets()
-            elif name == "list_tables":
-                return await self._list_tables(arguments)
-            elif name == "describe_table":
-                return await self._describe_table(arguments)
-            else:
-                return [{"type": "text", "text": f"Strumento sconosciuto: {name}"}]
-        except Exception as e:
-            logger.error(f"Errore nell'esecuzione dello strumento {name}: {e}")
-            return [{"type": "text", "text": f"Errore: {str(e)}"}]
-
-    def _convert_to_dict(self, content_list):
-        """Helper function per convertire TextContent objects in dizionari"""
-        result = []
-        for content in content_list:
-            if hasattr(content, 'model_dump'):
-                # È un oggetto Pydantic (TextContent)
-                result.append(content.model_dump())
-            elif isinstance(content, dict):
-                # È già un dizionario
-                result.append(content)
-            else:
-                # Fallback: converti in dizionario
-                result.append({"type": "text", "text": str(content)})
-        return result
-
-# FastAPI app
-app = FastAPI(title="BigQuery MCP HTTP Streamable Server")
-
-# Configura CORS
+# CORS configuration for n8n compatibility
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
 )
 
-# Istanza globale del server MCP
-mcp_server = None
+# Global BigQuery client
+bigquery_client = None
 
-@app.on_event("startup")
-async def startup_event():
-    global mcp_server
+def initialize_bigquery_client():
+    """Initialize BigQuery client with authentication"""
+    global bigquery_client
+    
     try:
-        mcp_server = BigQueryMCPServer()
-        logger.info("Server MCP BigQuery inizializzato con successo")
+        project_id = os.getenv('GOOGLE_PROJECT_ID')
+        if not project_id:
+            raise ValueError("GOOGLE_PROJECT_ID environment variable not set")
+        
+        # Try service account JSON from environment variable
+        credentials_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+        if credentials_json:
+            credentials_info = json.loads(credentials_json)
+            credentials = service_account.Credentials.from_service_account_info(credentials_info)
+            bigquery_client = bigquery.Client(project=project_id, credentials=credentials)
+            logger.info("BigQuery client initialized with service account from JSON")
+        else:
+            # Fall back to Application Default Credentials
+            bigquery_client = bigquery.Client(project=project_id)
+            logger.info("BigQuery client initialized with Application Default Credentials")
+            
     except Exception as e:
-        logger.error(f"Errore nell'inizializzazione del server MCP: {e}")
+        logger.error(f"Failed to initialize BigQuery client: {e}")
         raise
 
-@app.get("/")
-async def root():
-    return {
-        "message": "BigQuery MCP HTTP Streamable Server",
-        "status": "running",
-        "project_id": mcp_server.project_id if mcp_server else None,
-        "protocol": "HTTP Streamable",
-        "endpoints": {
-            "initialize": "/initialize",
-            "tools": "/tools",
-            "call": "/call"
+# MCP Tools definitions
+MCP_TOOLS = [
+    {
+        "name": "query_bigquery",
+        "description": "Esegue una query SQL su BigQuery e restituisce i risultati in formato strutturato",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Query SQL da eseguire su BigQuery (SELECT, WITH, etc.)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Numero massimo di righe da restituire (default: 100, max: 1000)",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 1000
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Se true, valida la query senza eseguirla (default: false)",
+                    "default": False
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "list_datasets",
+        "description": "Lista tutti i dataset disponibili nel progetto BigQuery corrente",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include dataset nascosti (default: false)",
+                    "default": False
+                }
+            }
+        }
+    },
+    {
+        "name": "list_tables",
+        "description": "Lista tutte le tabelle e viste in un dataset specificato",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataset_id": {
+                    "type": "string",
+                    "description": "ID del dataset di cui listare le tabelle"
+                },
+                "include_views": {
+                    "type": "boolean",
+                    "description": "Include le viste oltre alle tabelle (default: true)",
+                    "default": True
+                }
+            },
+            "required": ["dataset_id"]
+        }
+    },
+    {
+        "name": "describe_table",
+        "description": "Ottieni informazioni dettagliate su schema e metadati di una tabella",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataset_id": {
+                    "type": "string",
+                    "description": "ID del dataset contenente la tabella"
+                },
+                "table_id": {
+                    "type": "string",
+                    "description": "ID della tabella da descrivere"
+                },
+                "include_schema": {
+                    "type": "boolean",
+                    "description": "Include schema dettagliato dei campi (default: true)",
+                    "default": True
+                }
+            },
+            "required": ["dataset_id", "table_id"]
+        }
+    },
+    {
+        "name": "get_sample_data",
+        "description": "Ottieni dati di esempio da una tabella per comprenderne la struttura",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataset_id": {
+                    "type": "string",
+                    "description": "ID del dataset"
+                },
+                "table_id": {
+                    "type": "string",
+                    "description": "ID della tabella"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Numero di righe di esempio (default: 5, max: 50)",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 50
+                }
+            },
+            "required": ["dataset_id", "table_id"]
         }
     }
+]
 
-@app.get("/health")
-async def health_check():
+async def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute a specific MCP tool"""
+    
+    if not bigquery_client:
+        return {
+            "success": False,
+            "error": "BigQuery client not initialized"
+        }
+    
     try:
-        if mcp_server and mcp_server.client:
-            # Test connessione con una query semplice
-            query = "SELECT 1 as test_connection LIMIT 1"
-            query_job = mcp_server.client.query(query)
-            result = query_job.result()
-            return {
-                "status": "healthy",
-                "bigquery_connection": "ok",
-                "project_id": mcp_server.project_id
-            }
+        if tool_name == "query_bigquery":
+            return await query_bigquery(
+                arguments.get("query"),
+                arguments.get("limit", 100),
+                arguments.get("dry_run", False)
+            )
+        elif tool_name == "list_datasets":
+            return await list_datasets(arguments.get("include_hidden", False))
+        elif tool_name == "list_tables":
+            return await list_tables(
+                arguments.get("dataset_id"),
+                arguments.get("include_views", True)
+            )
+        elif tool_name == "describe_table":
+            return await describe_table(
+                arguments.get("dataset_id"),
+                arguments.get("table_id"),
+                arguments.get("include_schema", True)
+            )
+        elif tool_name == "get_sample_data":
+            return await get_sample_data(
+                arguments.get("dataset_id"),
+                arguments.get("table_id"),
+                arguments.get("limit", 5)
+            )
         else:
             return {
-                "status": "unhealthy", 
-                "bigquery_connection": "failed",
-                "error": "MCP server not initialized"
+                "success": False,
+                "error": f"Tool sconosciuto: {tool_name}"
             }
     except Exception as e:
+        logger.error(f"Error executing tool {tool_name}: {e}")
         return {
-            "status": "unhealthy",
-            "bigquery_connection": "failed", 
+            "success": False,
             "error": str(e)
         }
 
-# MCP HTTP Streamable Protocol Endpoints
-
-@app.post("/initialize")
-async def initialize():
-    """Inizializza la connessione MCP"""
+async def query_bigquery(query: str, limit: int = 100, dry_run: bool = False) -> Dict[str, Any]:
+    """Execute BigQuery SQL query"""
     try:
-        if not mcp_server:
-            raise HTTPException(status_code=500, detail="Server MCP non inizializzato")
+        job_config = bigquery.QueryJobConfig()
+        job_config.dry_run = dry_run
+        job_config.use_query_cache = True
+        job_config.maximum_bytes_billed = 1000000000  # 1GB limit
+        
+        # Execute query
+        query_job = bigquery_client.query(query, job_config=job_config)
+        
+        if dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "bytes_processed": query_job.total_bytes_processed,
+                "query_valid": True
+            }
+        
+        # Get results
+        results = query_job.result(max_results=limit)
+        
+        # Convert to list of dictionaries
+        rows = []
+        for row in results:
+            row_dict = {}
+            for i, field in enumerate(results.schema):
+                value = row[i]
+                # Handle datetime and other special types
+                if isinstance(value, datetime):
+                    value = value.isoformat()
+                elif hasattr(value, 'isoformat'):
+                    value = value.isoformat()
+                row_dict[field.name] = value
+            rows.append(row_dict)
         
         return {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {},
-                "prompts": {},
-                "resources": {}
-            },
-            "serverInfo": {
-                "name": "BigQuery MCP Server",
-                "version": "1.0.0"
-            },
-            "instructions": "Server MCP per BigQuery pronto per l'uso"
+            "success": True,
+            "row_count": len(rows),
+            "total_bytes_processed": query_job.total_bytes_processed,
+            "total_bytes_billed": query_job.total_bytes_billed,
+            "cache_hit": query_job.cache_hit,
+            "schema": [{"name": field.name, "type": field.field_type, "mode": field.mode} 
+                      for field in results.schema],
+            "data": rows
         }
+        
     except Exception as e:
-        logger.error(f"Errore inizializzazione: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/tools")
-async def list_tools():
-    """Lista tutti gli strumenti disponibili"""
-    try:
-        if not mcp_server:
-            raise HTTPException(status_code=500, detail="Server MCP non inizializzato")
-        
-        tools = await mcp_server.get_available_tools()
-        return {"tools": tools}
-    except Exception as e:
-        logger.error(f"Errore lista tools: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/call")
-async def call_tool(request: Request):
-    """Esegue uno strumento con streaming response"""
-    try:
-        if not mcp_server:
-            raise HTTPException(status_code=500, detail="Server MCP non inizializzato")
-        
-        body = await request.json()
-        tool_name = body.get("name")
-        arguments = body.get("arguments", {})
-        
-        if not tool_name:
-            raise HTTPException(status_code=400, detail="Nome strumento richiesto")
-        
-        logger.info(f"Esecuzione tool: {tool_name} con argomenti: {arguments}")
-        
-        # Esegui lo strumento
-        result = await mcp_server.execute_tool(tool_name, arguments)
-        converted_result = mcp_server._convert_to_dict(result)
-        
-        # Restituisci in formato MCP
         return {
-            "content": converted_result,
-            "isError": False
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Errore esecuzione tool: {e}")
-        return {
-            "content": [{"type": "text", "text": f"Errore: {str(e)}"}],
-            "isError": True
+            "success": False,
+            "error": str(e)
         }
 
-# Endpoint di compatibilità per testing
+async def list_datasets(include_hidden: bool = False) -> Dict[str, Any]:
+    """List all datasets in the project"""
+    try:
+        datasets = bigquery_client.list_datasets(include_all=include_hidden)
+        
+        dataset_list = []
+        for dataset in datasets:
+            dataset_ref = bigquery_client.get_dataset(dataset.dataset_id)
+            dataset_list.append({
+                "dataset_id": dataset.dataset_id,
+                "friendly_name": dataset_ref.friendly_name,
+                "description": dataset_ref.description,
+                "location": dataset_ref.location,
+                "created": dataset_ref.created.isoformat() if dataset_ref.created else None,
+                "modified": dataset_ref.modified.isoformat() if dataset_ref.modified else None,
+                "labels": dict(dataset_ref.labels) if dataset_ref.labels else {}
+            })
+        
+        return {
+            "success": True,
+            "dataset_count": len(dataset_list),
+            "datasets": dataset_list
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+async def list_tables(dataset_id: str, include_views: bool = True) -> Dict[str, Any]:
+    """List tables in a dataset"""
+    try:
+        dataset = bigquery_client.dataset(dataset_id)
+        tables = bigquery_client.list_tables(dataset)
+        
+        table_list = []
+        for table in tables:
+            table_ref = bigquery_client.get_table(table)
+            
+            # Filter views if requested
+            if not include_views and table_ref.table_type == "VIEW":
+                continue
+                
+            table_list.append({
+                "table_id": table.table_id,
+                "table_type": table_ref.table_type,
+                "num_rows": table_ref.num_rows,
+                "num_bytes": table_ref.num_bytes,
+                "created": table_ref.created.isoformat() if table_ref.created else None,
+                "modified": table_ref.modified.isoformat() if table_ref.modified else None,
+                "description": table_ref.description,
+                "labels": dict(table_ref.labels) if table_ref.labels else {}
+            })
+        
+        return {
+            "success": True,
+            "table_count": len(table_list),
+            "tables": table_list
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+async def describe_table(dataset_id: str, table_id: str, include_schema: bool = True) -> Dict[str, Any]:
+    """Get detailed table information"""
+    try:
+        table = bigquery_client.get_table(f"{dataset_id}.{table_id}")
+        
+        result = {
+            "success": True,
+            "table_id": table.table_id,
+            "dataset_id": table.dataset_id,
+            "project_id": table.project,
+            "table_type": table.table_type,
+            "num_rows": table.num_rows,
+            "num_bytes": table.num_bytes,
+            "created": table.created.isoformat() if table.created else None,
+            "modified": table.modified.isoformat() if table.modified else None,
+            "expires": table.expires.isoformat() if table.expires else None,
+            "description": table.description,
+            "location": table.location,
+            "labels": dict(table.labels) if table.labels else {}
+        }
+        
+        if include_schema and table.schema:
+            result["schema"] = [
+                {
+                    "name": field.name,
+                    "type": field.field_type,
+                    "mode": field.mode,
+                    "description": field.description
+                }
+                for field in table.schema
+            ]
+        
+        return result
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+async def get_sample_data(dataset_id: str, table_id: str, limit: int = 5) -> Dict[str, Any]:
+    """Get sample data from table"""
+    try:
+        query = f"SELECT * FROM `{dataset_id}.{table_id}` LIMIT {limit}"
+        return await query_bigquery(query, limit)
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+async def handle_mcp_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle MCP protocol requests"""
+    method = request_data.get("method")
+    params = request_data.get("params", {})
+    request_id = request_data.get("id")
+    
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "bigquery-mcp-server",
+                    "version": "1.0.0",
+                    "description": "BigQuery MCP Server with HTTP Streamable support"
+                }
+            }
+        }
+    
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": MCP_TOOLS
+            }
+        }
+    
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        
+        tool_result = await execute_tool(tool_name, arguments)
+        
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(tool_result, indent=2, ensure_ascii=False)
+                    }
+                ]
+            }
+        }
+    
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": f"Method not found: {method}"
+            }
+        }
+
+# HTTP Routes
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test BigQuery connection
+        if bigquery_client:
+            # Simple test query
+            job = bigquery_client.query("SELECT 1 as test", job_config=bigquery.QueryJobConfig(dry_run=True))
+            bq_status = "connected"
+        else:
+            bq_status = "not_initialized"
+    except Exception as e:
+        bq_status = f"error: {str(e)}"
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "bigquery_status": bq_status,
+        "version": "1.0.0"
+    }
+
 @app.get("/tools")
-async def get_tools():
-    """Endpoint GET per compatibility"""
-    try:
-        if not mcp_server:
-            return {"error": "Server MCP non inizializzato"}
-        
-        tools = await mcp_server.get_available_tools()
-        return {"tools": tools}
-    except Exception as e:
-        return {"error": str(e)}
+async def list_tools():
+    """List available tools (for debugging)"""
+    return {"tools": MCP_TOOLS}
 
-@app.post("/execute")
-async def execute_tool_post(request: Request):
-    """Endpoint POST per compatibility"""
+@app.post("/stream")
+async def mcp_stream_handler(request: Request):
+    """HTTP Streamable endpoint for MCP protocol"""
     try:
-        if not mcp_server:
-            return {"error": "Server MCP non inizializzato"}
+        request_data = await request.json()
+        logger.info(f"MCP Request: {request_data.get('method')} (ID: {request_data.get('id')})")
         
-        body = await request.json()
-        tool_name = body.get("tool_name") or body.get("name")
-        arguments = body.get("arguments", {})
+        response_data = await handle_mcp_request(request_data)
         
-        if not tool_name:
-            return {"error": "tool_name richiesto"}
+        # For HTTP Streamable, we return the response as text with newline
+        response_text = json.dumps(response_data, ensure_ascii=False) + "\n"
         
-        result = await mcp_server.execute_tool(tool_name, arguments)
-        return {"result": mcp_server._convert_to_dict(result)}
+        return StreamingResponse(
+            iter([response_text]),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+        
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Error handling MCP request: {e}")
+        error_response = {
+            "jsonrpc": "2.0",
+            "id": request_data.get("id") if 'request_data' in locals() else None,
+            "error": {
+                "code": -32603,
+                "message": str(e)
+            }
+        }
+        error_text = json.dumps(error_response) + "\n"
+        return StreamingResponse(
+            iter([error_text]),
+            media_type="text/plain",
+            status_code=500
+        )
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    logger.info("🚀 Starting BigQuery MCP Server...")
+    initialize_bigquery_client()
+    logger.info("✅ BigQuery MCP Server ready!")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "mcp_sse_server:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True
+    )
