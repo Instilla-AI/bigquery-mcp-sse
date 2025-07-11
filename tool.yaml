@@ -1,0 +1,4 @@
+sources:
+  my-bigquery-source:
+    kind: bigquery
+    project: YOUR_GOOGLE_CLOUD_PROJECT_ID # <--- DEVI INSERIRE QUI L'ID DEL TUO PROGETTO GOOGLE CLOUD
