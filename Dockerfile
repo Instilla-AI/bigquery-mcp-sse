@@ -1,33 +1,14 @@
-# Dockerfile
-FROM python:3.11-slim
+# Utilizza l'immagine Docker ufficiale del GenAI Toolbox come base
+FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest
 
-# Set working directory
+# Imposta la directory di lavoro all'interno del container
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# Copia il file tools.yaml nella directory di configurazione prevista dal toolbox
+COPY tools.yaml /config/tools.yaml
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Espone la porta su cui il server MCP è in ascolto (default 5000 per genai-toolbox)
+EXPOSE 5000
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY . .
-
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
-# Expose port
-EXPOSE 8000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# Start command
-CMD ["python", "mcp_sse_server.py"]
+# Comando per avviare il server MCP, puntando al file tools.yaml e ascoltando su tutte le interfacce
+CMD ["toolbox", "--tools-file", "/config/tools.yaml", "--address", "0.0.0.0"]
