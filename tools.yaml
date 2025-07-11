@@ -1,4 +1,0 @@
-sources:
-  my-bigquery-source:
-    kind: bigquery
-    project: big-query-instilla
